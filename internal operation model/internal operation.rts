@@ -1,0 +1,564 @@
+﻿/*
+This model demonstrates the simplified operation of blockchain that execution of burn-To-Claim protocol.
+ interact with the smart contract on the Ethereum platform.
+Suppose that a "request" contract has been deployed by a traveler. The following describes the role of each party:
+	Sender: a user 
+	Recipient:
+	Miner: any address that solves the puzzle by proof of work and decide which transaction to be included in the next block
+	
+Note that some miners may execute transactions with a higher gasPrice; some would choose to take another strategy to build a block.
+It is reasonable to assume that the smart contract has been deployed with some amount of deposit from the traveler and waiting for some hoteliers to search for.
+*/
+
+enum {ProposeFunction, na, newcomer, BurnAsset, MintAsset, ReclaimAsset};
+
+#define U 5; // # users
+#define M 5; // # miners
+#define chainSize 5; // The length of each blockchain
+#define maxTx 20; // The maximum number of transaction for each block
+#define blkGasLimit 20000; // The maximum gas limit for each block, which is calculated from a bunch of transactions wiht gas limit
+#define channelBufferSize 7;
+#define succAppendPrice 1000000; // reward for successfully appending the valid block
+#define contractAddr 9494; // smart contract address
+#define BURN 100; // gas consumption in terms of opcode
+#define MINT 100; // gas consumption in terms of opcode
+#define gasLimit 1000; // gas consumption limit per transaction
+#define gasPriceCondition 3; // miner's selection of gas price per transaction
+#define contractOwner 2; // the smart contract's owner address
+#define poolSize 3; // pool size to receive transactions for each miner
+#define proposalPoolSize 100; // pool size for received proposals
+#define dataSize 100;
+
+#define Sender 0; //sender address
+#define SenderReclaim 1; //sender recalim address
+#define Receiver 2; //recipient address 
+#define Attaker 3; //attaker address 
+#define BurnAddr 4; //burn address
+
+hvar SenderEncryptedKey =8;
+hvar RecipientEncryptedKey =8;
+hvar AttakerEncryptedKey =9;
+
+
+hvar rewardCount; // testing how many times the reward has been given to a miner; // Only one of the miners receives a reward on successfully mining a new block
+hvar userWallet[M][U] = [1000000000(M*U)];
+hvar proposalFrom[M][proposalPoolSize];
+hvar proposal[M][proposalPoolSize];
+hvar proposalPtr[M];
+hvar settledWith[M];
+hvar contractBalance = [1000000(M)];
+hvar lockedWallet[M]; // temperary wallet to lock up some of a user's wallet1
+hvar estimatedGas[M][maxTx]; // gas consumption until now
+hvar minerCoinbase[M]; // each miner has their coinbase
+hvar blockNum[M]; // blockNum for each miner
+hvar userCoinbase[U] = [100, 0(U-1)]; // user coinbase account 
+hvar LockTime ;
+hvar SecCode ;
+hvar EncryptedCode ;
+var Network ;
+
+hvar SharedSecCode ;
+
+hvar burnState =0;
+hvar mintState =0;
+hvar reclaimState =0;
+hvar overallState =0;
+
+
+hvar pendUid[M][maxTx];
+hvar pendFromAddr[M][maxTx];
+hvar pendToAddr[M][maxTx];
+hvar pendOp[M][maxTx];
+hvar pendField[M][maxTx];
+hvar pendState[M][maxTx];
+hvar pendValue[M][maxTx]; //
+hvar chain[M][chainSize]; // a mapping from blockNum to blockUid
+hvar block[dataSize][maxTx]; // a mapping from blockUid to txUid
+
+var pendSecCode[M][maxTx]; //Secret code
+
+// each tx has the following information, and they are globally shared to save some memory used
+hvar txUid = 1;
+hvar blockUid = 1;
+hvar txFromAddr[dataSize];
+hvar txToAddr[dataSize];
+hvar txOp[dataSize];
+hvar txField[dataSize];
+hvar txState[dataSize];
+hvar txValue[dataSize];
+hvar txSecCode[dataSize]; //Secret code
+
+
+// the following is a pool of transactions
+hvar poolTxAddr[M][poolSize];
+hvar poolTxVal[M][poolSize];
+hvar poolTxGas[M][poolSize];
+hvar poolTxGasPrice[M][poolSize];
+hvar poolTxFunction[M][poolSize];
+hvar poolPtr[M];
+hvar inPoolPtr[M];
+
+hvar poolSecCode[M][poolSize]; //Secret code
+hvar poolNetwork[M][poolSize]; //network
+
+// the following is a block of transactions
+hvar blkTxAddr[M][maxTx];
+hvar blkTxVal[M][maxTx];
+hvar blkTxGas[M][maxTx];
+hvar blkTxGasPrice[M][maxTx];
+hvar blkTxFunction[M][maxTx];
+hvar blkTotalGas[M];
+hvar blkSize[M];
+hvar blkSecCode[M][maxTx]; //Secret code
+hvar bLKNetwork[M][maxTx]; //network
+
+// below is the channels for sending data
+channel mnet[M] channelBufferSize;
+channel broadcast_network1[M] channelBufferSize;
+channel broadcast_network2[M] channelBufferSize;
+channel bnet[M] channelBufferSize;
+channel listen[U] channelBufferSize;
+channel datach[M] channelBufferSize;
+
+
+///-------------------------- Application Layer ----------------------------------
+
+// on the user'side, invoking a function
+//An user address addr to invoke a function include val, gas, gasPrice
+User(network, addr, val, secCode, gas, gasPrice, function) =
+//if (network==1 || network==2) {
+	TxBrdcst(0, network, addr,  val, secCode,  gas, gasPrice, function)
+//	} else {
+//	Skip
+//	}
+	;
+
+// an interface that listens to the state change
+Listener(addr) = listen[addr]?network -> listenerReceiving -> User(network, addr, 0, 9, gasLimit, 5, 0); 
+
+//broadcast transactin to each miner
+TxBrdcst(iter, network, addr, val, secCode, gas, gasPrice, function) = 
+	atomic{
+		if (iter < M) {
+		case
+		{ network ==1: // broadcast to network 1
+			broadcast_network1[iter]!network.addr.val.secCode.gas.gasPrice.function -> 
+			TxBrdcst(iter+1, network, addr,  val, secCode, gas, gasPrice, function)
+			network ==2: // broadcast to network 2
+		//	broadcast_network2[iter]!network.addr.val.secCode.gas.gasPrice.function -> 
+			broadcast_network1[iter]!network.addr.val.secCode.gas.gasPrice.function -> 
+			TxBrdcst(iter+1, network, addr,  val, secCode, gas, gasPrice, function)
+			}
+		} else {
+			Skip
+		}
+	};
+
+// inserting new transactions into the pool
+// check whether the sender has enough value and gas before a miner accepts the transaction
+TxPool(i) = 
+	broadcast_network1[i]?network.addr.val.secCode.gas.gasPrice.function ->
+      if (userWallet[i][addr] >=  (gas * gasPrice) && gas > 0) { 
+	TxInsert(i, network, addr,  val, secCode, gas, gasPrice, function)
+	} else {
+		TxPool(i)
+	};
+
+TxInsert(i, network, addr,  val, secCode, gas, gasPrice, function) =
+	if (poolPtr[i] < poolSize) {
+		if (poolTxGas[i][poolPtr[i]] == 0) {
+			txReceive{
+				var ptr = poolPtr[i];
+				poolTxAddr[i][ptr] = addr;
+				poolTxVal[i][ptr] = val;
+				poolSecCode[i][ptr] = secCode; //Secret code
+				poolNetwork[i][ptr]= network; //network
+				poolTxGas[i][ptr] = gas;
+				poolTxGasPrice[i][ptr] = gasPrice;
+				poolTxFunction[i][ptr] = function;
+				poolPtr[i]++;
+			}
+			->
+			datach[i]!newcomer
+			->
+			TxPool(i)
+		} else {
+			next{poolPtr[i]++;} ->
+			TxInsert(i, network, addr,  val, secCode, gas, gasPrice, function)
+		}
+	} else {
+		next{poolPtr[i] = 0;} ->
+		TxInsert(i, network, addr,  val, secCode, gas, gasPrice, function)
+	};
+
+
+//------------------------------------------- Implementation Layer --------------------------------
+
+// including available transactions from the pool
+TxBlock(i) = 
+	if (inPoolPtr[i] < poolSize) {
+		if (!call(cempty, datach[i])) {
+			datach[i]?newcomer ->
+			if (poolTxGas[i][inPoolPtr[i]] == 0) { // zero indicates no more available transactions
+				if (blkSize[i] >= 1) {
+					Miner(i, 0)
+				} else {
+					TxBlock(i)
+				}
+			} else {
+				if (blkTotalGas[i] + poolTxGas[i][inPoolPtr[i]] <= blkGasLimit) { // the total gas consumption limit for each miner
+					if (poolTxGasPrice[i][inPoolPtr[i]] >= gasPriceCondition) { // find the transactions which meets the gasPrice minimum
+						txInclude{
+							var pIter = inPoolPtr[i];
+							var bIter = blkSize[i];
+							blkTxAddr[i][bIter] = poolTxAddr[i][pIter];
+							blkTxVal[i][bIter] = poolTxVal[i][pIter];
+							blkSecCode[i][bIter] = poolSecCode[i][pIter]; //Secret code
+							bLKNetwork[i][bIter] = poolNetwork[i][pIter]; //network
+							blkTxGas[i][bIter] = poolTxGas[i][pIter];
+							blkTxGasPrice[i][bIter] = poolTxGasPrice[i][pIter];
+							blkTxFunction[i][bIter] = poolTxFunction[i][pIter];
+							blkTotalGas[i] = blkTotalGas[i] + poolTxGas[i][pIter];
+							poolTxAddr[i][pIter] = 0;
+							poolTxVal[i][pIter] = 0;
+							poolSecCode[i][pIter]=0; //Secret code
+							poolNetwork[i][pIter]=0;//network
+							poolTxGas[i][pIter] = 0;
+							poolTxGasPrice[i][pIter] = 0;
+							poolTxFunction[i][pIter] = 0;
+							inPoolPtr[i]++;
+							blkSize[i]++;
+						} ->
+						TxBlock(i)
+					} else {
+						nextTx{inPoolPtr[i]++;}
+						->
+						TxBlock(i)
+					}
+				} else if (blkSize[i] >= 1) {
+					Miner(i, 0)
+				} else {
+					nextTx{inPoolPtr[i]++;}
+					->
+					TxBlock(i)
+				}
+			}
+		} else if (blkSize[i] >= 1) {
+			Miner(i, 0)
+		} else {
+			TxBlock(i)
+		}
+	} else {
+		nextTx{inPoolPtr[i] = 0;}
+		->
+		TxBlock(i)
+	};
+
+// start mining the block where transactions were collected
+Miner(i, iter) = 
+	if (iter < blkSize[i]) {
+		LockUp(i, iter)// value and gas
+		
+	} else {
+		BlkUpdate(i, 0)
+	};
+
+Execution(i, iter) = consumed ->
+	execution{
+		pendUid[i][iter] = txUid;
+		pendFromAddr[i][iter] = blkTxAddr[i][iter];
+		pendToAddr[i][iter] = contractAddr; 
+		pendOp[i][iter] = blkTxFunction[i][iter];
+		pendField[i][iter] = na;
+		pendState[i][iter] = 1;
+		pendValue[i][iter] = blkTxVal[i][iter];
+		pendSecCode[i][iter] = blkSecCode[i][iter]; //Secret code
+		txUid++;
+	} -> LockedReturn(i, iter, true);
+	
+
+// to lock up the total value including the gas to execute the transaction from a use
+LockUp(i, iter) = 
+	weiLockUp{
+		var addr = blkTxAddr[i][iter];
+		var val = blkTxVal[i][iter];
+		var gas = blkTxGas[i][iter];
+		var gasPrice = blkTxGasPrice[i][iter];
+		var lockedTotal = (gas * gasPrice);
+			userWallet[i][addr] = userWallet[i][addr] - lockedTotal;
+		lockedWallet[i] = lockedTotal;
+	} ->
+	TxExec(i, iter);
+
+// acting like invoking predefined functions in the smart contract; here just dispatch the execution for each of the functions
+TxExec(i, iter) = 
+	case {
+			// this is for Burn the asset
+			blkTxFunction[i][iter] == BurnAsset:
+			if (Sender == blkTxAddr[i][iter]) {
+				GasConsume(i, iter, BURN); BurnCoin(i, iter, Sender); Execution(i, iter)
+			} else {
+				LockedReturn(i, iter, false)
+			}
+			 //this is for mint the asset 
+			blkTxFunction[i][iter] == MintAsset:
+			if (Receiver == blkTxAddr[i][iter] && EncryptedCode == RecipientEncryptedKey && LockTime == 0) {
+				GasConsume(i, iter, MINT); MintCoin(i, iter, Receiver); Execution(i, iter)
+			} else {
+				LockedReturn(i, iter, false)
+			}
+			//this is for reclaim the asset 
+			blkTxFunction[i][iter] == ReclaimAsset:
+			if (SenderReclaim == blkTxAddr[i][iter] && EncryptedCode == SenderEncryptedKey && LockTime == 1) {
+				GasConsume(i, iter, MINT); MintCoin(i, iter, SenderReclaim); Execution(i, iter)
+			} else {
+				LockedReturn(i, iter, false)
+			}
+	};
+	
+
+// remove the value form senders account
+BurnCoin(i, iter, adr) = burncoin {
+	var val = blkTxVal[i][iter]; // value
+	userCoinbase[adr] = userCoinbase[adr] - val; // remove the asset
+	userCoinbase[4] = userCoinbase[4] + val; // transfer to burn Address
+	EncryptedCode = SenderEncryptedKey; //set the security code
+	} -> burned -> Skip;
+	
+	// add the value to an account
+MintCoin(i, iter, adr) = mintcoin {
+	var val = blkTxVal[i][iter]; // value
+	userCoinbase[adr] = userCoinbase[adr] + val;
+	} -> minted -> Skip;
+
+GasConsume(i, iter, opcode) =
+	if (estimatedGas[i][iter] + opcode > blkTxGas[i][iter]) {
+		ExecFail(i, iter)
+	} else {
+		consuming{
+			var gasPrice = blkTxGasPrice[i][iter];
+			var price = opcode * gasPrice;
+			minerCoinbase[i] = minerCoinbase[i] + price;
+			lockedWallet[i] = lockedWallet[i] - price;
+			estimatedGas[i][iter] = estimatedGas[i][iter] + opcode;
+		} -> consumed -> Skip
+	};
+		
+ExecFail(i, iter) =
+	lockedReset{
+		lockedWallet[i] = 0;
+	} -> BlkDetect(i, iter, false);
+
+// return the remaining gas to the user
+LockedReturn(i, iter, success) = 
+	returnGas{
+		var addr = blkTxAddr[i][iter];
+		var return = (blkTxGas[i][iter] - estimatedGas[i][iter]) * blkTxGasPrice[i][iter];
+		userWallet[i][addr] = userWallet[i][addr] + return;
+		lockedWallet[i] = 0;
+	} ->
+	BlkDetect(i, iter, success);
+		
+// before executing the next transaction, check whether there is any block from another miner. Under assumption that the miner chooses the first arrival block
+BlkDetect(i, iter, success) = 
+	if (call(cempty, bnet[i])) {
+		Miner(i, iter+1)
+	} else {
+		bnet[i]?j.newBlockNum.blockid -> BlkAppend(i, j, newBlockNum, blockid)
+	};
+
+// clear the container and reuse the container for newly created transactions
+Reset(i, iter) = 
+	if (iter < blkSize[i]) {
+		clearTx{
+			pendUid[i][iter] = 0;
+			pendFromAddr[i][iter] = 0;
+			pendToAddr[i][iter] = 0;
+			pendOp[i][iter] = 0;
+			pendField[i][iter] = 0;
+			pendState[i][iter] = 0;
+			pendValue[i][iter] = 0;
+			blkTxAddr[i][iter] = 0;
+			blkTxVal[i][iter] = 0;
+			blkTxGas[i][iter] = 0;
+			blkTxGasPrice[i][iter] = 0;
+			blkTxFunction[i][iter] = 0;
+			estimatedGas[i][iter] = 0;
+		} ->
+		Reset(i, iter+1)
+	} else {
+		clearBlk{
+			blkTotalGas[i] = 0;
+			blkSize[i] = 0;
+		} ->
+		TxBlock(i)
+	};
+
+// append the latest block and update the state in the blockchain
+BlkAppend(i, j, newBlockNum, blockid) = 
+	append{
+		chain[i][newBlockNum] = blockid;
+		blockNum[i]++;
+		blkSize[i] = blkSize[j];
+	} ->
+	ChainUpdate(i, 0, blockid);
+
+// update their own chain
+ChainUpdate(i, iter, blockid) = 
+	if (iter < blkSize[i]) {
+		case {
+				txOp[block[blockid][iter]] == BurnAsset:
+				settle{
+					var id = block[blockid][iter];
+					var addr = txFromAddr[id];
+					var data = txState[id];
+					settledWith[i] = data;
+					userWallet[i][data] = userWallet[i][data] + txValue[id];
+				} ->
+				ChainUpdate(i, iter+1, blockid)
+				txOp[block[blockid][iter]] == MintAsset:
+				settle{
+					var id = block[blockid][iter];
+					var addr = txFromAddr[id];
+					var data = txState[id];
+					settledWith[i] = data;
+					userWallet[i][data] = userWallet[i][data] + txValue[id];
+				} ->
+				ChainUpdate(i, iter+1, blockid)
+				txOp[block[blockid][iter]] == ReclaimAsset:
+				settle{
+					var id = block[blockid][iter];
+					var addr = txFromAddr[id];
+					var data = txState[id];
+					settledWith[i] = data;
+					userWallet[i][data] = userWallet[i][data] + txValue[id];
+				} ->
+				ChainUpdate(i, iter+1, blockid)
+		}
+	} else {
+		Reset(i, 0)
+	};
+
+// broadcasting the mined block to other miners
+BlkBrdcst(i, iter, newBlockNum, blockid) = 
+	if (i == iter && iter < M) {
+		BlkBrdcst(i, iter+1, newBlockNum, blockid)
+	} else if (iter < M) {
+		bnet[iter]!i.newBlockNum.blockid ->
+		BlkBrdcst(i, iter+1, newBlockNum, blockid)
+	} else {
+		updateBlockUid{blockUid++;} ->
+		BlkAppend(i, i, newBlockNum, blockid)
+	};
+
+// update the globally shared state
+BlkUpdate(i, iter) = 
+	if (iter < blkSize[i]) {
+		update{
+			block[blockUid][iter] = pendUid[i][iter];
+			txFromAddr[pendUid[i][iter]] = pendFromAddr[i][iter];
+			txToAddr[pendUid[i][iter]] = pendToAddr[i][iter];
+			txOp[pendUid[i][iter]] = pendOp[i][iter];
+			txField[pendUid[i][iter]] = pendField[i][iter];
+			txState[pendUid[i][iter]] = pendState[i][iter];
+		} ->
+		BlkUpdate(i, iter+1)
+	} else {
+		reward{minerCoinbase[i] = minerCoinbase[i] + succAppendPrice; rewardCount++;} ->
+		BlkBrdcst(i, 0, blockNum[i], blockUid)
+	};
+	
+//***************************************************************************
+// defined address
+//sender = 0, sender recalim = 1 recipient = 2 attaker = 3, burn = 4
+//***************************************************************************
+// the mining process
+Mining = (|||i:{0..M-1} @ (TxPool(i) ||| TxBlock(i)));
+// sender burn the asset.	
+ExitTransaction = User(1, 0, 1, SenderEncryptedKey, gasLimit, 5, BurnAsset);
+// recipient claim the asset
+EntryTransaction = User(2, 2, 1, RecipientEncryptedKey, gasLimit, 5, MintAsset);
+// sender reclaim the asset after time-lock time
+ReclaimTransaction = User(1, 1, 1, SenderEncryptedKey, gasLimit, 5, ReclaimAsset);
+
+
+///********ATTAKER*******************************************************************************
+// attaker try with make a claim
+EntryTransaction_attaker = User(2, 3,  1, AttakerEncryptedKey, gasLimit, 5, MintAsset);
+//***********************************************************************************************
+
+// check independent  process
+// Senter burn the asset and recipient mint the asset
+CrossChain_Transfer_only_burn = Mining ||| (ExitTransaction);
+CrossChain_Transfer_only_mint = Mining ||| (time{LockTime = 0} -> (secCode{EncryptedCode = 8} -> EntryTransaction));
+Unspendability = Mining ||| User(1, 0, 1, SenderEncryptedKey, gasLimit, 5, BurnAsset);
+
+// check the transaction labeled with network 1
+Check_network1 = Mining ||| EntryTransaction ||| Listener(0);
+
+// check the transaction labeled with network 2
+Check_network2 = Mining ||| EntryTransaction ||| Listener(2);
+
+// check the overall process
+//********************************************************************************************************************
+CrossChain_process =  Mining ||| (ExitTransaction; Wait[10] ; EntryTransaction);
+
+CrossChain_reclaim_process = Mining ||| (ExitTransaction interrupt[1] (time{LockTime = 1} -> ReclaimTransaction));
+
+//malicious recipient - using a wrong key
+CrossChain_Transfer_malicious_recipient = Mining ||| (ExitTransaction; Wait[10] ; (EntryTransaction_attaker ||| EntryTransaction));
+
+//malicious sender  before time lock
+CrossChain_Transfer_malicious_sender = Mining ||| (ExitTransaction; (ReclaimTransaction ||| EntryTransaction));
+
+
+//********************checking conditions*****************************************************************************
+//sender = 0, sender recalim = 1 recipient = 2 attaker = 3, burn = 4
+// check initial asset balances
+#define initial_state (userCoinbase[0]==100 && userCoinbase[1]==0 && userCoinbase[2]==0 && userCoinbase[3]==0 && userCoinbase[4]==0); 
+
+#define burnAddress (userCoinbase[4]==1);
+#define burn (userCoinbase[0]==99 && userCoinbase[4]==1);
+#define mint (userCoinbase[0]==99 && userCoinbase[2]==1); 
+
+#define reclaim (userCoinbase[1]==1 && userCoinbase[2]==0);
+
+#define only_mint (userCoinbase[2]==1); 
+#define only_burn (userCoinbase[0]==99); 
+
+#define COMPLETE_Exchange (burn && mint);
+#define COMPLETE_Reclaim (burn && reclaim);
+
+#define ExitTransaction_NetworkCheck (Network == 1);
+
+#define EntryTransaction_NetworkCheck (Network == 2);
+
+///*************** Assertions - reachability ************************************
+// An assertion is a query about the system behaviors.  
+// Given a process, an assertion can check whether the process reach a state at which some given condition is satisfied. 
+// Below defined process checks the condition defined above.
+//**************************************************************************
+// check initial asset balance of senders, recipinet and burnaddress
+#assert Mining |= []initial_state; 
+
+#assert Unspendability reaches burnAddress;
+
+#assert Check_network1 |= ExitTransaction_NetworkCheck -> listenerReceiving; // liste to the network number
+
+#assert Check_network2 |= EntryTransaction_NetworkCheck -> listenerReceiving; // liste to the network number
+
+#assert CrossChain_Transfer_only_mint reaches only_mint;
+#assert CrossChain_Transfer_only_burn reaches only_burn;
+
+// ideal condition
+#assert CrossChain_process() reaches COMPLETE_Exchange;
+#assert CrossChain_reclaim_process() reaches COMPLETE_Reclaim;
+
+// malicious recipient/sender
+#assert CrossChain_Transfer_malicious_recipient() reaches COMPLETE_Exchange;
+#assert CrossChain_Transfer_malicious_sender() reaches COMPLETE_Exchange;
+
+
+
+
+

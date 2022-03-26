@@ -1,0 +1,301 @@
+﻿// A model of the burn-to-claim protocol
+
+// N1 = 0 
+// N2 = 1
+enum{N1, N2}; 
+
+// A transaction is a tuple of 6 items:
+// 1) sender key, 2) recipient key, 3) beta, 4) v, 5) gamma, 6) miner key. 
+// if gamma is -1, then it is unkown.
+// Do not model the fifth item Tx' (previous transaction) as it is not 
+// important in the verification.
+#define TxItems 6;
+// The maximum number of transactions in a blockchain
+#define MaxTx 2; 
+
+// The structure of blockchain is not critical in this model.
+// For simplicity, we view a blockchain as a list of transactions.
+// tx[0] are transactions in Network1, tx[1] are transactions in Network2.
+hvar tx[2][MaxTx][TxItems]; 
+hvar txCount[2]; // The current number of transactions on each blockchain.
+
+// A key generated for each transaction. 
+// Here we just increment it every time there's a new event.
+// gamma doubles as a time stamp in this model.
+hvar gamma = 0; 
+
+// The amount for transfers.
+#define TxAmount 2;
+
+// Initial wallet amount.
+#define InitAmount 10;
+
+// The maximum number of nodes (including users and miners but excluding the sender and the Recipient,
+// which we model separately) in a blockchain.
+// Users can only transfer funds within a network. 
+// Only the sender and the recipient can transfer funds cross networks.
+#define MaxUsers 2; 
+
+// A user stores the fund in its wallet.
+// K_P, K_R, K_addr, sig are all represented by the index of the node --- they all have the same value.
+// That is, users[][i]'s key is i.
+// nodes[0][] are nodes in Network1, nodes[1][] are nodes in Network2.
+hvar users[2][MaxUsers] = [InitAmount(2*MaxUsers)]; 
+
+// # of miners in each network
+#define MaxMiners 1; 
+
+#define ChannelBufferSize 1;
+// channel communication format: 
+// sendernetwork.senderkey.recipientnetwork.recipientkey.beta.amount.gamma
+channel trans1 ChannelBufferSize; // channel for transfer on Network1
+channel trans2 ChannelBufferSize; // channel for transfer on Network2
+		
+channel exit ChannelBufferSize; // channel for exit transfer
+channel enter ChannelBufferSize; // channel for entry transfer
+channel rec ChannelBufferSize; // channel for reclaim transfer
+
+
+// Operation of a user is simply requesting a transfer from key to (key+1, which may not exist) 
+// WITHIN the same network, and loop.
+User1(key) = [txCount[N1] < MaxTx && !call(cfull,trans1)]trans1!N1.key.N1.key+1.0.TxAmount.-1 -> User1(key);	
+	
+MinerVerify1(key, n1, k1, n2, k2, b, x, g) =
+	if (n1 == n2 && k1 >= 0 && k1 < MaxUsers && k2 >= 0 &&  k2 < MaxUsers && users[n1][k1] >= x) {
+		execute1{
+			users[n1][k1] = users[n1][k1] - x; 
+			users[n1][k2] = users[n1][k2] + x;
+			tx[n1][txCount[n1]][0] = k1;
+			tx[n1][txCount[n1]][1] = k2;
+			tx[n1][txCount[n1]][2] = b;
+			tx[n1][txCount[n1]][3] = x;
+			tx[n1][txCount[n1]][4] = g;
+			tx[n1][txCount[n1]][5] = key;
+			txCount[n1] = txCount[n1] + 1;
+			gamma = gamma + 1;
+		} -> Miner1(key)
+	}
+	else {
+		Miner1(key)
+	};
+	
+	
+// Operation of a miner
+Miner1(key) = 
+	[txCount[N1] < MaxTx]
+	((trans1?n1.k1.n2.k2.b.x.g -> MinerVerify1(key, n1, k1, n2, k2, b, x, g)) 
+	[] 
+	(exit?n1.k1.n2.k2.b.x.g -> ExitTransaction(key, n1, k1, n2, k2, x, g))
+	[]
+	(rec?n1.k1.n2.k2.b.x.g -> ReclaimTransaction(key, n1, k1, n2, k2, x, g)));
+	
+// Duplicated code for Network2
+User2(key) = [txCount[N2] < MaxTx && !call(cfull,trans2)]trans2!N2.key.N2.key-1.0.TxAmount.-1 -> User2(key);	
+	
+MinerVerify2(key, n1, k1, n2, k2, b, x, g) =
+	if (n1 == n2 && k1 >= 0 && k1 < MaxUsers && k2 >= 0 && k2 < MaxUsers && users[n1][k1] >= x) {
+		execute2{
+			users[n1][k1] = users[n1][k1] - x; 
+			users[n1][k2] = users[n1][k2] + x;
+			tx[n1][txCount[n1]][0] = k1;
+			tx[n1][txCount[n1]][1] = k2;
+			tx[n1][txCount[n1]][2] = b;
+			tx[n1][txCount[n1]][3] = x;
+			tx[n1][txCount[n1]][4] = g;
+			tx[n1][txCount[n1]][5] = key;
+			txCount[n1] = txCount[n1] + 1;
+			gamma = gamma + 1;
+		} -> Miner2(key)
+	}
+	else {
+		Miner2(key)
+	};
+	
+Miner2(key) = 
+	[txCount[N2] < MaxTx]
+	((trans2?n1.k1.n2.k2.b.x.g -> MinerVerify2(key, n1, k1, n2, k2, b, x, g))
+	[]
+	(enter?n1.k1.n2.k2.b.x.g -> EntryTransaction(key, n1, k1, n2, k2, x, g)));
+
+Blockchains = (|||x:{0..MaxMiners-1}@Miner1(x)) ||| (|||x:{0..MaxMiners-1}@Miner2(x)) ||| 
+	(|||x:{0..MaxUsers-1}@User1(x)) ||| (|||x:{0..MaxUsers-1}@User2(x));
+	
+// The additional processes for the burn-to-claim protocol
+
+#define TimeLimit 3;
+// Stores the time stamp (gamma) when the time lock begins.
+// If the value is -1, then the time lock is unlocked.
+hvar timeLockBegin = -1; 
+
+var burned = 0; // The value stored at the burn address.
+
+// Shared secret between Sender and Recipient
+hvar secret;
+
+// We simply model "hashing" as +1.
+
+Sender(n1, k1, n2, k2, v) = 
+	exitinit{gamma = gamma + 1; secret = gamma;} -> 
+	exit!n1.k1.n2.k2.burned.v.secret+1 -> Skip;
+
+hvar xTranId;
+
+enum{statePrep, stateBurned, stateClaimed, stateReclaimed};
+
+// Initially, the protocol is in the prep state.
+var protocolState = statePrep;
+
+hvar preSenderWallet;
+hvar preRecipientWallet;
+hvar postSenderWallet;
+hvar postRecipientWallet;
+
+ExitTransaction(key, n1, k1, n2, k2, v, h) = 
+	if (users[n1][k1] >= v) { // simplified exportVerifier as we don't consider cryto
+		burn{
+			preSenderWallet = users[n1][k1];
+			preRecipientWallet = users[n2][k2];
+			users[n1][k1] = users[n1][k1] - v;
+			burned = v;
+			timeLockBegin = gamma;
+			tx[n1][txCount[n1]][0] = k1;
+			tx[n1][txCount[n1]][1] = k2;
+			tx[n1][txCount[n1]][2] = burned;
+			tx[n1][txCount[n1]][3] = v;
+			tx[n1][txCount[n1]][4] = h;
+			tx[n1][txCount[n1]][5] = key;
+			xTranId = txCount[n1];
+			txCount[n1] = txCount[n1] + 1;
+			gamma = gamma + 1;
+			protocolState = stateBurned;
+		} -> Miner1(key) 
+	}
+	else {
+		Miner1(key)
+	};
+
+Recipient(n1, k1, n2, k2, v) = [protocolState == stateBurned]enter!n1.k1.n2.k2.burned.v.secret+1 -> Skip;
+
+//malicious recipient - using a wrong key
+maliciousRecipient(n1, k1, n2, k2, v) = [protocolState == stateBurned]enter!n1.k1.n2.k2.burned.v.secret+2 -> Skip;
+	
+EntryTransaction(key, n1, k1, n2, k2, v, h) = 
+	if (timeLockBegin != -1 && gamma - timeLockBegin <= TimeLimit && // time lock check
+		burned == v && // simplified prooofVerifier
+		h == tx[n1][xTranId][4]) { // simplified checking of hashed gamma
+		claim{
+			users[n2][k2] = users[n2][k2] + v;
+			postSenderWallet = users[n1][k1];
+			postRecipientWallet = users[n2][k2];
+			tx[n2][txCount[n2]][0] = k1;
+			tx[n2][txCount[n2]][1] = k2;
+			tx[n2][txCount[n2]][2] = burned;
+			tx[n2][txCount[n2]][3] = v;
+			tx[n2][txCount[n2]][4] = h;
+			tx[n2][txCount[n2]][5] = key;
+			txCount[n2] = txCount[n2] + 1;
+			burned = 0; // reset burn address
+			timeLockBegin = -1; // unlock time lock
+			gamma = gamma + 1;
+			protocolState = stateClaimed;
+		} -> Miner2(key)
+	}
+	else {
+		Miner2(key)
+	};
+	
+SenderReclaim(n1, k1, n2, k2, v) = 
+	[protocolState == stateBurned && timeLockBegin != -1 && gamma - timeLockBegin > TimeLimit]
+	rec!n1.k1.n2.k2.burned.v.secret+1 -> Skip;
+	
+maliciousSenderReclaim(n1, k1, n2, k2, v) =
+	[protocolState == stateBurned && timeLockBegin != 1 && gamma - timeLockBegin > TimeLimit]
+	rec!n1.k1.n2.k2.burned.v.secret+1 -> Skip;
+	
+ReclaimTransaction(key, n1, k1, n2, k2, v, h) = 
+	if (timeLockBegin != -1 && gamma - timeLockBegin > TimeLimit && // time lock check
+		burned == v && // simplified prooofVerifier
+		h == tx[n1][xTranId][4]) { // simplified checking of hashed gamma
+		reclaim{
+			users[n1][k1] = users[n1][k1] + v;
+			postSenderWallet = users[n1][k1];
+			postRecipientWallet = users[n2][k2];
+			tx[n1][txCount[n1]][0] = k1;
+			tx[n1][txCount[n1]][1] = k2;
+			tx[n1][txCount[n1]][2] = burned;
+			tx[n1][txCount[n1]][3] = v;
+			tx[n1][txCount[n1]][4] = h;
+			tx[n1][txCount[n1]][5] = key;
+			txCount[n1] = txCount[n1] + 1;
+			burned = 0; // reset burn address
+			timeLockBegin = -1; // unlock time lock
+			gamma = gamma + 1;
+			protocolState = stateReclaimed;
+		} -> Miner1(key)
+	}
+	else {
+		Miner1(key)
+	};
+	
+BurnToClaim(n1, k1, n2, k2, v) = 
+	[txCount[N1] < MaxTx && txCount[N2] < MaxTx]
+	//(Sender(n1, k1, n2, k2, v) ||| Recipient(n1, k1, n2, k2, v) ||| SenderClaim(n1, k1, n2, k2, v));
+	((Sender(n1, k1, n2, k2, v);Recipient(n1, k1, n2, k2, v))
+	<>
+	(Sender(n1, k1, n2, k2, v);maliciousRecipient(n1, k1, n2, k2, v))
+	<>
+	(Sender(n1, k1, n2, k2, v);SenderReclaim(n1, k1, n2, k2, v))
+	<>
+	(Sender(n1, k1, n2, k2, v);maliciousSenderReclaim(n1, k1, n2, k2, v)));
+	
+#define crossTransAmount 5;
+
+CrossBlockchains = (|||x:{0..MaxMiners-1}@Miner1(x)) ||| (|||x:{0..MaxMiners-1}@Miner2(x)) ||| 
+	(|||x:{0..MaxUsers-1}@User1(x)) ||| (|||x:{0..MaxUsers-1}@User2(x)) ||| 
+	BurnToClaim(N1, 0, N2, 1, crossTransAmount);
+	
+//CrossBlockchainsOnly = (|||x:{0..MaxMiners-1}@Miner1(x)) ||| (|||x:{0..MaxMiners-1}@Miner2(x)) ||| 
+//	BurnToClaim(N1, 0, N2, 1, crossTransAmount);
+	
+// Verificatino of properties.
+
+#define running (txCount[N1] < MaxTx && txCount[N2] < MaxTx);
+
+#define pClaimed (protocolState == stateClaimed);
+#define pBurned (protocolState == stateBurned);
+#define pReclaimed (protocolState == stateReclaimed);
+
+// Property: burn before claim.
+// In other words, burn cannot happen after claim.
+#assert CrossBlockchains |= [](pClaimed -> [](!pBurned));
+
+// Property: double spending
+#define recipientClaimed ((postRecipientWallet - preRecipientWallet) == crossTransAmount);
+#define senderReclaimed (postSenderWallet == preSenderWallet);
+// Part of double spending: if the asset is claimed by recipient,
+// then it can't be reclaimed by sender.
+#assert CrossBlockchains |= [](pClaimed -> [](!pReclaimed));
+// The other part of double spending: it is not possible that the recipient's wallet increase
+// while the sender's wallet remain the same.
+#assert CrossBlockchains |= []!(recipientClaimed && senderReclaimed);
+
+//Property: correctness
+// If an asset is burned then in every future state 
+// either the asset is still in the burn address
+// or the asset is claimed by Recipient
+// or the asset is reclaimed by Sender
+#define burnValueExists (burned > 0);
+#assert CrossBlockchains |= [](pBurned -> [](burnValueExists || pClaimed || pReclaimed));
+
+// Recipient claim and Sender reclaim cannot both happen in any timeline.
+// The other direction is already verified above.
+#assert CrossBlockchains |= [](pReclaimed -> [](!pClaimed));
+
+// It's not possible that burn address still has value but the asset is already claimed by Recipient.
+#assert CrossBlockchains |= []!(burnValueExists && pClaimed);
+// It's not possible that burn address still has value but the asset is already reclaimed by Sender.
+#assert CrossBlockchains |= []!(burnValueExists && pReclaimed);
+
+// Property: atomicity.
+#define protocolCompleted (pClaimed || pReclaimed);
+#assert CrossBlockchains |= [](protocolCompleted -> (recipientClaimed || senderReclaimed));
